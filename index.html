@@ -147,6 +147,38 @@
       flex-shrink: 0;
     }
 
+    .find-replace {
+      display: flex;
+      gap: 6px;
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .find-replace input {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--bg);
+      color: var(--text);
+      padding: 4px 8px;
+      min-width: 120px;
+    }
+
+    .find-replace button {
+      padding: 4px 7px;
+      font-size: 11px;
+    }
+
+    .find-status {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-left: auto;
+    }
+
     .dot-left {
       width: 7px; height: 7px;
       border-radius: 50%;
@@ -289,6 +321,15 @@
       border-radius: 3px;
     }
 
+    .highlight-layer .find-match {
+      background: #ffd33d66;
+      border-radius: 2px;
+    }
+
+    .highlight-layer .find-active {
+      background: #ff7b72a6;
+    }
+
     .highlight-layer .hl-line.hl-blank {
       visibility: hidden;
     }
@@ -360,6 +401,15 @@
   <div class="panes">
     <div class="pane">
       <div class="pane-header"><span class="dot-left"></span> Original (Baseline)</div>
+      <div class="find-replace">
+        <input id="leftFind" placeholder="Find..." spellcheck="false">
+        <input id="leftReplace" placeholder="Replace..." spellcheck="false">
+        <button onclick="navigateFind('left', -1)">↑</button>
+        <button onclick="navigateFind('left', 1)">↓</button>
+        <button onclick="replaceOne('left')">Replace</button>
+        <button onclick="replaceAll('left')">All</button>
+        <span class="find-status" id="leftFindStatus">0 matches</span>
+      </div>
       <div class="editor-scroll" id="leftScroll">
         <div class="editor-container">
           <div class="gutter" id="leftGutter"></div>
@@ -373,6 +423,15 @@
 
     <div class="pane">
       <div class="pane-header"><span class="dot-right"></span> Modified</div>
+      <div class="find-replace">
+        <input id="rightFind" placeholder="Find..." spellcheck="false">
+        <input id="rightReplace" placeholder="Replace..." spellcheck="false">
+        <button onclick="navigateFind('right', -1)">↑</button>
+        <button onclick="navigateFind('right', 1)">↓</button>
+        <button onclick="replaceOne('right')">Replace</button>
+        <button onclick="replaceAll('right')">All</button>
+        <span class="find-status" id="rightFindStatus">0 matches</span>
+      </div>
       <div class="editor-scroll" id="rightScroll">
         <div class="editor-container">
           <div class="gutter" id="rightGutter"></div>
@@ -405,12 +464,22 @@
   const rightScroll = document.getElementById('rightScroll');
   const statsEl = document.getElementById('stats');
   const langSelect = document.getElementById('langSelect');
+  const leftFind = document.getElementById('leftFind');
+  const leftReplace = document.getElementById('leftReplace');
+  const rightFind = document.getElementById('rightFind');
+  const rightReplace = document.getElementById('rightReplace');
+  const leftFindStatus = document.getElementById('leftFindStatus');
+  const rightFindStatus = document.getElementById('rightFindStatus');
 
   let debounceTimer = null;
 
   // Minimap state (populated by compare, used by updateMinimaps)
   let lastLeftInfo = {};
   let lastRightInfo = {};
+  const findState = {
+    left: { matches: [], active: 0, lineRanges: {} },
+    right: { matches: [], active: 0, lineRanges: {} }
+  };
 
   function escapeHtml(str) {
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -509,6 +578,119 @@
     };
   }
 
+  function insertRangeMarkers(syntaxHtml, ranges) {
+    if (!ranges.length) return syntaxHtml;
+    let out = '', textPos = 0, rIdx = 0, inside = null;
+
+    function openIfNeeded() {
+      if (inside || rIdx >= ranges.length) return;
+      if (textPos >= ranges[rIdx].start) {
+        out += '<span class="' + ranges[rIdx].cls + '">';
+        inside = ranges[rIdx];
+      }
+    }
+    function closeIfNeeded() {
+      if (!inside) return;
+      if (textPos >= inside.end) {
+        out += '</span>';
+        inside = null;
+        rIdx++;
+        openIfNeeded();
+      }
+    }
+
+    for (let i = 0; i < syntaxHtml.length;) {
+      if (syntaxHtml[i] === '<') {
+        if (inside) out += '</span>';
+        const end = syntaxHtml.indexOf('>', i);
+        out += syntaxHtml.substring(i, end + 1);
+        i = end + 1;
+        if (inside) out += '<span class="' + inside.cls + '">';
+      } else if (syntaxHtml[i] === '&') {
+        openIfNeeded();
+        const semi = syntaxHtml.indexOf(';', i);
+        if (semi !== -1 && semi - i < 8) {
+          out += syntaxHtml.substring(i, semi + 1);
+          i = semi + 1;
+        } else {
+          out += syntaxHtml[i];
+          i++;
+        }
+        textPos++;
+        closeIfNeeded();
+      } else {
+        openIfNeeded();
+        out += syntaxHtml[i];
+        i++;
+        textPos++;
+        closeIfNeeded();
+      }
+    }
+    if (inside) out += '</span>';
+    return out;
+  }
+
+  function prepareFindState(side, lines) {
+    const query = (side === 'left' ? leftFind.value : rightFind.value);
+    const state = findState[side];
+    state.matches = [];
+    state.lineRanges = {};
+    if (!query) {
+      state.active = 0;
+      return;
+    }
+
+    let global = 0;
+    lines.forEach((line, idx) => {
+      const ranges = [];
+      let pos = 0;
+      while (true) {
+        const at = line.indexOf(query, pos);
+        if (at === -1) break;
+        const item = { line: idx + 1, start: at, end: at + query.length, globalStart: global + at };
+        state.matches.push(item);
+        ranges.push(item);
+        pos = at + query.length;
+      }
+      if (ranges.length) state.lineRanges[idx + 1] = ranges;
+      global += line.length + 1;
+    });
+
+    if (state.active >= state.matches.length) state.active = state.matches.length ? state.matches.length - 1 : 0;
+    updateFindStatus(side);
+  }
+
+  function markFindForLine(side, lineNum, html) {
+    const state = findState[side];
+    const ranges = state.lineRanges[lineNum];
+    if (!ranges || !ranges.length) return html;
+
+    const active = state.matches[state.active];
+    const markers = ranges.map(r => ({
+      start: r.start,
+      end: r.end,
+      cls: (active && active.line === r.line && active.start === r.start) ? 'find-match find-active' : 'find-match'
+    }));
+    return insertRangeMarkers(html, markers);
+  }
+
+  function updateFindStatus(side) {
+    const state = findState[side];
+    const el = side === 'left' ? leftFindStatus : rightFindStatus;
+    if (!state.matches.length) el.textContent = '0 matches';
+    else el.textContent = (state.active + 1) + '/' + state.matches.length;
+  }
+
+  function selectMatch(side) {
+    const state = findState[side];
+    const ta = side === 'left' ? leftInput : rightInput;
+    const match = state.matches[state.active];
+    if (!match) return;
+    ta.focus();
+    ta.selectionStart = match.globalStart;
+    ta.selectionEnd = match.globalStart + (side === 'left' ? leftFind.value.length : rightFind.value.length);
+  }
+
   function scheduleCompare() {
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(compare, 100);
@@ -518,6 +700,10 @@
     const left = leftInput.value;
     const right = rightInput.value;
     const lang = langSelect.value;
+    const leftLines = left.split('\n');
+    const rightLines = right.split('\n');
+    prepareFindState('left', leftLines);
+    prepareFindState('right', rightLines);
 
     if (!left && !right) {
       leftHL.innerHTML = '';
@@ -533,13 +719,14 @@
     }
 
     if (left === right) {
-      const lines = left.split('\n');
       let lH = '', rH = '', lG = '', rG = '';
-      lines.forEach((line, i) => {
+      leftLines.forEach((line, i) => {
         const n = i + 1;
         const hl = highlightLine(line, lang) || ' ';
-        lH += '<span class="hl-line">' + hl + '</span>';
-        rH += '<span class="hl-line">' + hl + '</span>';
+        const leftMarked = markFindForLine('left', n, hl);
+        const rightMarked = markFindForLine('right', n, hl);
+        lH += '<span class="hl-line">' + leftMarked + '</span>';
+        rH += '<span class="hl-line">' + rightMarked + '</span>';
         lG += '<span class="ln">' + n + '</span>';
         rG += '<span class="ln">' + n + '</span>';
       });
@@ -604,9 +791,6 @@
     // We need to build highlight layers that match the textarea content exactly
     // (one hl-line per actual text line) so the overlay aligns.
 
-    const leftLines = left.split('\n');
-    const rightLines = right.split('\n');
-
     // Build maps: lineNumber -> diff info
     const leftInfo = {};  // lNum -> { type: 'del'|'pair'|'eq', html? }
     const rightInfo = {}; // rNum -> { type: 'add'|'pair'|'eq', html? }
@@ -635,11 +819,11 @@
       const num = idx + 1;
       const info = leftInfo[num];
       if (info && info.type === 'del') {
-        lH += '<span class="hl-line hl-del">' + (info.html || ' ') + '</span>';
+        lH += '<span class="hl-line hl-del">' + markFindForLine('left', num, info.html || ' ') + '</span>';
         lG += '<span class="ln ln-del">' + num + '</span>';
       } else {
         const hl = highlightLine(line, lang) || ' ';
-        lH += '<span class="hl-line">' + hl + '</span>';
+        lH += '<span class="hl-line">' + markFindForLine('left', num, hl) + '</span>';
         lG += '<span class="ln">' + num + '</span>';
       }
     });
@@ -650,11 +834,11 @@
       const num = idx + 1;
       const info = rightInfo[num];
       if (info && info.type === 'add') {
-        rH += '<span class="hl-line hl-add">' + (info.html || ' ') + '</span>';
+        rH += '<span class="hl-line hl-add">' + markFindForLine('right', num, info.html || ' ') + '</span>';
         rG += '<span class="ln ln-add">' + num + '</span>';
       } else {
         const hl = highlightLine(line, lang) || ' ';
-        rH += '<span class="hl-line">' + hl + '</span>';
+        rH += '<span class="hl-line">' + markFindForLine('right', num, hl) + '</span>';
         rG += '<span class="ln">' + num + '</span>';
       }
     });
@@ -706,6 +890,49 @@
   function clearAll() {
     leftInput.value = '';
     rightInput.value = '';
+    leftFind.value = '';
+    rightFind.value = '';
+    leftReplace.value = '';
+    rightReplace.value = '';
+    compare();
+  }
+
+  function navigateFind(side, direction) {
+    const state = findState[side];
+    if (!state.matches.length) {
+      updateFindStatus(side);
+      return;
+    }
+    state.active = (state.active + direction + state.matches.length) % state.matches.length;
+    selectMatch(side);
+    updateFindStatus(side);
+    compare();
+  }
+
+  function replaceOne(side) {
+    const ta = side === 'left' ? leftInput : rightInput;
+    const findVal = side === 'left' ? leftFind.value : rightFind.value;
+    const replaceVal = side === 'left' ? leftReplace.value : rightReplace.value;
+    if (!findVal) return;
+    const state = findState[side];
+    if (!state.matches.length) return;
+
+    const current = state.matches[state.active];
+    ta.value = ta.value.slice(0, current.globalStart) + replaceVal + ta.value.slice(current.globalStart + findVal.length);
+    compare();
+    if (findState[side].matches.length) {
+      findState[side].active = Math.min(state.active, findState[side].matches.length - 1);
+      selectMatch(side);
+      compare();
+    }
+  }
+
+  function replaceAll(side) {
+    const ta = side === 'left' ? leftInput : rightInput;
+    const findVal = side === 'left' ? leftFind.value : rightFind.value;
+    const replaceVal = side === 'left' ? leftReplace.value : rightReplace.value;
+    if (!findVal) return;
+    ta.value = ta.value.split(findVal).join(replaceVal);
     compare();
   }
 
@@ -853,6 +1080,8 @@
 
   leftInput.addEventListener('input', scheduleCompare);
   rightInput.addEventListener('input', scheduleCompare);
+  leftFind.addEventListener('input', compare);
+  rightFind.addEventListener('input', compare);
   langSelect.addEventListener('change', compare);
   window.addEventListener('resize', () => { fitTextareas(); updateMinimaps(); });
 </script>
